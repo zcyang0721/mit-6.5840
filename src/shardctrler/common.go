@@ -23,15 +23,14 @@ import (
 // You will need to add fields to the RPC argument structs.
 //
 
-// The number of shards.
+// 分区数量，每个key映射到一个分区，如hash(key) % NShards
 const NShards = 10
 
-// A configuration -- an assignment of shards to groups.
-// Please don't change this.
+// 配置项，将分片划分配到指定组
 type Config struct {
-	Num    int              // config number
+	Num    int              // Config 编号
 	Shards [NShards]int     // shard -> gid
-	Groups map[int][]string // gid -> servers[]
+	Groups map[int][]string // gid -> servers[]  该 group 的 server 列表
 }
 
 func DefaultConfig() Config {
@@ -106,12 +105,12 @@ func (err Err) String() string {
 }
 
 type CommandRequest struct {
-	Servers   map[int][]string // for Join
-	GIDs      []int            // for Leave
-	Shard     int              // for Move
-	GID       int              // for Move
-	Num       int              // for Query
-	Op        OperationOp
+	Servers   map[int][]string // for Join：新加入的gid -> server[]
+	GIDs      []int            // for Leave：删除的group
+	Shard     int              // for Move：要移动的分片
+	GID       int              // for Move：移动到该group
+	Num       int              // for Query：查询的config编号
+	Op        OperationOp	   // RPC命令
 	ClientId  int64
 	CommandId int64
 }

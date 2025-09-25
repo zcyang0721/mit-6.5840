@@ -68,10 +68,10 @@ func (err Err) String() string {
 type ShardStatus uint8
 
 const (
-	Serving ShardStatus = iota
-	Pulling
-	BePulling
-	GCing
+	Serving ShardStatus = iota   // 正常提供服务
+    Pulling                      // 正在从旧群组拉取数据（新接管方）
+    BePulling                    // 正在被别的 group 拉取（旧持有方）
+    GCing                        // 正在进行垃圾回收（旧持有方），此时已可服务
 )
 
 func (status ShardStatus) String() string {
@@ -88,6 +88,7 @@ func (status ShardStatus) String() string {
 	panic(fmt.Sprintf("unexpected ShardStatus %d", status))
 }
 
+// 客户端去重上下文
 type OperationContext struct {
 	MaxAppliedCommandId int64
 	LastResponse        *CommandResponse
@@ -97,9 +98,10 @@ func (context OperationContext) deepCopy() OperationContext {
 	return OperationContext{context.MaxAppliedCommandId, &CommandResponse{context.LastResponse.Err, context.LastResponse.Value}}
 }
 
+// 写入 Raft 的统一日志条目封装体
 type Command struct {
-	Op   CommandType
-	Data interface{}
+	Op   CommandType	// 命令类型
+	Data interface{}	// 具体 payload（不同类型下会是不同结构）
 }
 
 func (command Command) String() string {
@@ -129,11 +131,11 @@ func NewEmptyEntryCommand() Command {
 type CommandType uint8
 
 const (
-	Operation CommandType = iota
-	Configuration
-	InsertShards
-	DeleteShards
-	EmptyEntry
+	Operation CommandType = iota	// 客户端的 Put/Get/Append 操作（Data 为 CommandRequest）
+	Configuration	// config 变更（Data 为 shardctrler.Config）
+	InsertShards	// 插入（安装）从旧 group 拉来的 shard（Data 为 ShardOperationResponse）
+	DeleteShards	// 删除本组上已经迁移走的 shard（Data 为 ShardOperationRequest）
+	EmptyEntry		// 空条目，常用于快照/保持 leader 活跃或作为 commit 空检测
 )
 
 func (op CommandType) String() string {
@@ -193,6 +195,7 @@ func (response CommandResponse) String() string {
 	return fmt.Sprintf("{Err:%v,Value:%v}", response.Err, response.Value)
 }
 
+// 新组向旧组发起“拉取”请求
 type ShardOperationRequest struct {
 	ConfigNum int
 	ShardIDs  []int
@@ -202,11 +205,12 @@ func (request ShardOperationRequest) String() string {
 	return fmt.Sprintf("{ConfigNum:%v,ShardIDs:%v}", request.ConfigNum, request.ShardIDs)
 }
 
+// 旧组回复给新组的迁移包
 type ShardOperationResponse struct {
 	Err            Err
 	ConfigNum      int
-	Shards         map[int]map[string]string
-	LastOperations map[int64]OperationContext
+	Shards         map[int]map[string]string	// 每个要迁移的 shard 的具体 key/value 数据
+	LastOperations map[int64]OperationContext	// 旧组对每个客户端的去重上下文
 }
 
 func (response ShardOperationResponse) String() string {

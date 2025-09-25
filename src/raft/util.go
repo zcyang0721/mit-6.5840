@@ -28,16 +28,18 @@ func DPrintf(format string, a ...interface{}) {
 // snapshots) on the applyCh, but set CommandValid to false for these
 // other uses.
 //
-type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandTerm  int
-	CommandIndex int
 
-	SnapshotValid bool
-	Snapshot      []byte
-	SnapshotTerm  int
-	SnapshotIndex int
+// Raft 层与上层服务交互的消息格式，通过 applyCh 管道传递。
+type ApplyMsg struct {
+	CommandValid bool	// true：普通日志消息
+	Command      interface{}	// 存放被提交的应用层命令
+	CommandTerm  int	// 这条日志在 Raft 中写入时的 term
+	CommandIndex int	// 这条日志在 Raft 日志里的索引
+
+	SnapshotValid bool	// true：快照消息
+	Snapshot      []byte	// 快照的二进制内容
+	SnapshotTerm  int	// 这个快照对应的最后一条日志的 term
+	SnapshotIndex int	// 这个快照包含的最后一条日志的 index
 }
 
 func (msg ApplyMsg) String() string {
@@ -100,10 +102,12 @@ const (
 	ElectionTimeout  = 1000
 )
 
+// 心跳频率稳定在125毫秒/次
 func StableHeartbeatTimeout() time.Duration {
 	return time.Duration(HeartbeatTimeout) * time.Millisecond
 }
 
+// 得到1000到1999毫秒之间的随机超时时间
 func RandomizedElectionTimeout() time.Duration {
 	return time.Duration(ElectionTimeout+globalRand.Intn(ElectionTimeout)) * time.Millisecond
 }
@@ -131,17 +135,11 @@ func insertionSort(sl []int) {
 	}
 }
 
-// shrinkEntriesArray discards the underlying array used by the entries slice
-// if most of it isn't being used. This avoids holding references to a bunch of
-// potentially large entries that aren't needed anymore. Simply clearing the
-// entries wouldn't be safe because clients might still be using them.
+// 释放切片底层数组中未被使用的、多余的内存空间，防止内存泄漏
 func shrinkEntriesArray(entries []Entry) []Entry {
-	// We replace the array if we're using less than half of the space in
-	// it. This number is fairly arbitrary, chosen as an attempt to balance
-	// memory usage vs number of allocations. It could probably be improved
-	// with some focused tuning.
 	const lenMultiple = 2
-	if len(entries)*lenMultiple < cap(entries) {
+	if len(entries)*lenMultiple < cap(entries) {	// 使用的空间不到总容量的一半
+		// 创建并返回紧凑数组
 		newEntries := make([]Entry, len(entries))
 		copy(newEntries, entries)
 		return newEntries

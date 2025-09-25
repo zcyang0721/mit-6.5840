@@ -22,8 +22,8 @@ type Command struct {
 }
 
 type OperationContext struct {
-	MaxAppliedCommandId int64
-	LastResponse        *CommandResponse
+	MaxAppliedCommandId int64				// 记录特定客户端已应用的最大命令序列号
+	LastResponse        *CommandResponse	// 存储最后一次执行的命令响应
 }
 
 type OperationOp uint8

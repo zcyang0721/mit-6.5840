@@ -26,32 +26,33 @@ import (
 	"time"
 )
 
-//
 // A Go object implementing a single Raft peer.
-//
 type Raft struct {
-	mu        sync.RWMutex        // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
-	dead      int32               // set by Kill()
+	mu        sync.RWMutex        // 读写锁，用于保护节点共享状态的并发访问
+	peers     []*labrpc.ClientEnd // 集群中所有节点的 RPC 通信端点列表
+	persister *Persister          // 持久化存储对象，用于保存 Raft 的核心状态和状态机快照
+	me        int                 // 当然节点索引，当前节点 peers[me]
+	dead      int32               // set by Kill()，控制 goroutine 的退出逻辑
 
-	applyCh        chan ApplyMsg
-	applyCond      *sync.Cond   // used to wakeup applier goroutine after committing new entries
-	replicatorCond []*sync.Cond // used to signal replicator goroutine to batch replicating entries
-	state          NodeState
+	applyCh        chan ApplyMsg  // 用于向状态机传递已提交日志条目的通道
+	applyCond      *sync.Cond     // 条件变量，用于在新日志被提交后唤醒负责将日志应用到状态机的 goroutine
+	replicatorCond []*sync.Cond   // 每个跟随者对应一个条件变量，用于触发批量复制日志的 goroutine
+	state          NodeState	  // 节点角色状态
 
-	currentTerm int
-	votedFor    int
-	logs        []Entry // the first entry is a dummy entry which contains LastSnapshotTerm, LastSnapshotIndex and nil Command
+	currentTerm int				// 当前任期号，节点发起选举时递增
+	votedFor    int				// 当前任期内投票给的候选者 ID
+	logs        []Entry 		// 日志条目数组，每个entry包含了日志索引、状态机命令和接收该条目的任期号
 
-	commitIndex int
-	lastApplied int
-	nextIndex   []int
-	matchIndex  []int
+    // 以下4个字段为易失状态
 
-	electionTimer  *time.Timer
-	heartbeatTimer *time.Timer
+	commitIndex int             // 已提交的日志条目的最大索引（已提交指已被大多数服务器复制）
+	lastApplied int				// 已应用到状态机的最大日志索引
+
+	nextIndex   []int           // 记录对每个跟随者的下一个要发送的日志索引（初始为leader最后一条日志索引+1）
+	matchIndex  []int           // 记录每个跟随者已经复制的最高的日志索引，进而判断日志是否提交
+
+	electionTimer  *time.Timer  // 选举计时器，由跟随者和候选者维护
+	heartbeatTimer *time.Timer  // 心跳计时器，仅领导者使用
 }
 
 // return currentTerm and whether this server
@@ -107,120 +108,158 @@ func (rf *Raft) encodeState() []byte {
 	return w.Bytes()
 }
 
-//
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
-//
+// 被上层服务（状态机）调用，用于有条件地安装通过 applyCh 接收到的快照
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("{Node %v} service calls CondInstallSnapshot with lastIncludedTerm %v and lastIncludedIndex %v to check whether snapshot is still valid in term %v", rf.me, lastIncludedTerm, lastIncludedIndex, rf.currentTerm)
+	DPrintf("{Node %v} service calls CondInstallSnapshot with lastIncludedTerm %v and lastIncludedIndex %v to check"+
+            "whether snapshot is still valid in term %v", rf.me, lastIncludedTerm, lastIncludedIndex, rf.currentTerm)
 
-	// outdated snapshot
+	// 快照的最后包含索引<=当前的提交索引，说明在快照传递过程中，节点已经提交了更新的日志，拒绝安装快照
 	if lastIncludedIndex <= rf.commitIndex {
-		DPrintf("{Node %v} rejects the snapshot which lastIncludedIndex is %v because commitIndex %v is larger", rf.me, lastIncludedIndex, rf.commitIndex)
+		DPrintf("{Node %v} rejects the snapshot which lastIncludedIndex is %v because commitIndex %v is larger",
+                    rf.me, lastIncludedIndex, rf.commitIndex)
 		return false
 	}
 
 	if lastIncludedIndex > rf.getLastLog().Index {
-		rf.logs = make([]Entry, 1)
+		rf.logs = make([]Entry, 1)  // 情况1：如果快照索引超过最后日志索引，创建全新的日志数组（只包含一个虚拟条目）
 	} else {
 		rf.logs = shrinkEntriesArray(rf.logs[lastIncludedIndex-rf.getFirstLog().Index:])
-		rf.logs[0].Command = nil
+		rf.logs[0].Command = nil    // 情况2：如果快照索引在日志范围内，截断日志并保留快照索引之后的条目
 	}
-	// update dummy entry with lastIncludedTerm and lastIncludedIndex
+
+	// 更新元数据和虚拟条目
 	rf.logs[0].Term, rf.logs[0].Index = lastIncludedTerm, lastIncludedIndex
 	rf.lastApplied, rf.commitIndex = lastIncludedIndex, lastIncludedIndex
 
-	rf.persister.SaveStateAndSnapshot(rf.encodeState(), snapshot)
-	DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} after accepting the snapshot which lastIncludedTerm is %v, lastIncludedIndex is %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), lastIncludedTerm, lastIncludedIndex)
+	rf.persister.SaveStateAndSnapshot(rf.encodeState(), snapshot)   // 持久化状态
+	DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v}"+
+            "after accepting the snapshot which lastIncludedTerm is %v, lastIncludedIndex is %v",
+            rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(),
+            rf.getLastLog(), lastIncludedTerm, lastIncludedIndex)
 	return true
 }
 
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
+// 创建快照
+//
+// 上层服务通知 Raft 模块，已经将直到索引 index 的所有状态都保存到快照里了，不再需要维护这些日志条目了，可以安全截断
+// index: 应用程序已经完成处理的最高日志索引
+// snapshot: 应用程序序列化后的状态机数据
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	snapshotIndex := rf.getFirstLog().Index
-	if index <= snapshotIndex {
-		DPrintf("{Node %v} rejects replacing log with snapshotIndex %v as current snapshotIndex %v is larger in term %v", rf.me, index, snapshotIndex, rf.currentTerm)
+	snapshotIndex := rf.getFirstLog().Index     // 获取当前快照索引
+	if index <= snapshotIndex {     // 拒绝过时请求
+		DPrintf("{Node %v} rejects replacing log with snapshotIndex %v as current snapshotIndex %v"+
+                "is larger in term %v", rf.me, index, snapshotIndex, rf.currentTerm)
 		return
 	}
 	rf.logs = shrinkEntriesArray(rf.logs[index-snapshotIndex:])
 	rf.logs[0].Command = nil
 	rf.persister.SaveStateAndSnapshot(rf.encodeState(), snapshot)
-	DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} after replacing log with snapshotIndex %v as old snapshotIndex %v is smaller", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), index, snapshotIndex)
+	DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v}"+
+            "after replacing log with snapshotIndex %v as old snapshotIndex %v is smaller",
+            rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied,
+            rf.getFirstLog(), rf.getLastLog(), index, snapshotIndex)
 }
 
+// 投票者处理投票请求的RPC
 func (rf *Raft) RequestVote(request *RequestVoteRequest, response *RequestVoteResponse) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
-	defer DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} before processing requestVoteRequest %v and reply requestVoteResponse %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), request, response)
+	defer DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v}"+
+                "before processing requestVoteRequest %v and reply requestVoteResponse %v",
+                rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), request, response)
 
+    // 拒绝投票：1.请求任期小于当前任期 2.请求任期等于当前任期，但本节点已经投过票，且投的不是这个候选人
 	if request.Term < rf.currentTerm || (request.Term == rf.currentTerm && rf.votedFor != -1 && rf.votedFor != request.CandidateId) {
 		response.Term, response.VoteGranted = rf.currentTerm, false
 		return
 	}
+
+    // 发现更高任期：退位并更新任期，但只是重置投票记录，还未投票给本候选人
 	if request.Term > rf.currentTerm {
 		rf.ChangeState(StateFollower)
 		rf.currentTerm, rf.votedFor = request.Term, -1
 	}
+    // 拒绝投票：3.候选人日志不如本节点更新
 	if !rf.isLogUpToDate(request.LastLogTerm, request.LastLogIndex) {
 		response.Term, response.VoteGranted = rf.currentTerm, false
 		return
 	}
+
+    // 同意投票
 	rf.votedFor = request.CandidateId
 	rf.electionTimer.Reset(RandomizedElectionTimeout())
 	response.Term, response.VoteGranted = rf.currentTerm, true
 }
 
+// Follower 节点调用，用于处理 Leader 发来的心跳或日志复制请求的RPC
 func (rf *Raft) AppendEntries(request *AppendEntriesRequest, response *AppendEntriesResponse) {
-	rf.mu.Lock()
+	// 锁定与持久化
+    rf.mu.Lock()
 	defer rf.mu.Unlock()
 	defer rf.persist()
-	defer DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} before processing AppendEntriesRequest %v and reply AppendEntriesResponse %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), request, response)
+	defer DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v}"+
+            "before processing AppendEntriesRequest %v and reply AppendEntriesResponse %v", 
+            rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, 
+            rf.getFirstLog(), rf.getLastLog(), request, response)
 
+    //【1】 任期检查与状态维护
+    // 请求来自一个过期的 Leader（任期号小于自己），则直接拒绝
 	if request.Term < rf.currentTerm {
 		response.Term, response.Success = rf.currentTerm, false
 		return
 	}
 
+    // 来自更高任期，无条件承认其权威
 	if request.Term > rf.currentTerm {
 		rf.currentTerm, rf.votedFor = request.Term, -1
 	}
 
+    // 收到合法任期的心跳后，转变为 Follower
 	rf.ChangeState(StateFollower)
 	rf.electionTimer.Reset(RandomizedElectionTimeout())
 
+    //【2】 日志一致性检查
+    // Leader 要复制的日志起点已经被本节点制作成了快照并截断了，触发 Leader 的快照发送逻辑
 	if request.PrevLogIndex < rf.getFirstLog().Index {
 		response.Term, response.Success = 0, false
-		DPrintf("{Node %v} receives unexpected AppendEntriesRequest %v from {Node %v} because prevLogIndex %v < firstLogIndex %v", rf.me, request, request.LeaderId, request.PrevLogIndex, rf.getFirstLog().Index)
+		DPrintf("{Node %v} receives unexpected AppendEntriesRequest %v from {Node %v}" + 
+                "because prevLogIndex %v < firstLogIndex %v", rf.me, request, request.LeaderId,
+                request.PrevLogIndex, rf.getFirstLog().Index)
 		return
 	}
 
+    // 任期冲突处理
 	if !rf.matchLog(request.PrevLogTerm, request.PrevLogIndex) {
 		response.Term, response.Success = rf.currentTerm, false
 		lastIndex := rf.getLastLog().Index
+        // 情况1：Follower的日志太短，在PrevLogIndex处根本没有条目
 		if lastIndex < request.PrevLogIndex {
 			response.ConflictTerm, response.ConflictIndex = -1, lastIndex+1
 		} else {
+        // 情况2：Follower在PrevLogIndex处有条目，但任期不匹配
 			firstIndex := rf.getFirstLog().Index
-			response.ConflictTerm = rf.logs[request.PrevLogIndex-firstIndex].Term
-			index := request.PrevLogIndex - 1
+			response.ConflictTerm = rf.logs[request.PrevLogIndex-firstIndex].Term   // 获取冲突的任期
+			// 回溯到冲突任期的第一个条目的位置
+            index := request.PrevLogIndex - 1
 			for index >= firstIndex && rf.logs[index-firstIndex].Term == response.ConflictTerm {
 				index--
 			}
-			response.ConflictIndex = index
+			response.ConflictIndex = index  // 告诉Leader冲突任期的第一个索引
 		}
 		return
 	}
 
+    //【3】 接受并追加日志条目
 	firstIndex := rf.getFirstLog().Index
 	for index, entry := range request.Entries {
+        // 从 PrevLogIndex + 1 的位置开始，检查每个条目
+        // 超出了本地日志的范围，或者该位置的条目任期与 Leader 发来的不匹配，则执行强制覆盖
+        // 保证了 Follower 的日志最终会和 Leader 的日志完全一致
 		if entry.Index-firstIndex >= len(rf.logs) || rf.logs[entry.Index-firstIndex].Term != entry.Term {
 			rf.logs = shrinkEntriesArray(append(rf.logs[:entry.Index-firstIndex], request.Entries[index:]...))
 			break
@@ -232,10 +271,13 @@ func (rf *Raft) AppendEntries(request *AppendEntriesRequest, response *AppendEnt
 	response.Term, response.Success = rf.currentTerm, true
 }
 
+// follower 应用快照
 func (rf *Raft) InstallSnapshot(request *InstallSnapshotRequest, response *InstallSnapshotResponse) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} before processing InstallSnapshotRequest %v and reply InstallSnapshotResponse %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), request, response)
+	defer DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v}"+
+            "before processing InstallSnapshotRequest %v and reply InstallSnapshotResponse %v",
+            rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), request, response)
 
 	response.Term = rf.currentTerm
 
@@ -256,6 +298,7 @@ func (rf *Raft) InstallSnapshot(request *InstallSnapshotRequest, response *Insta
 		return
 	}
 
+    // 启动 goroutine 异步发送快照到应用通道
 	go func() {
 		rf.applyCh <- ApplyMsg{
 			SnapshotValid: true,
@@ -266,35 +309,9 @@ func (rf *Raft) InstallSnapshot(request *InstallSnapshotRequest, response *Insta
 	}()
 }
 
-//
-// example code to send a RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
+// 发送 RPC 到目标服务器的示例代码
+// labrpc 包模拟了一个有损网络，其中服务器可能无法访问，请求和回复可能会丢失。
+
 func (rf *Raft) sendRequestVote(server int, request *RequestVoteRequest, response *RequestVoteResponse) bool {
 	return rf.peers[server].Call("Raft.RequestVote", request, response)
 }
@@ -307,33 +324,42 @@ func (rf *Raft) sendInstallSnapshot(server int, request *InstallSnapshotRequest,
 	return rf.peers[server].Call("Raft.InstallSnapshot", request, response)
 }
 
+// 领导选举核心部分，由 Candidate 状态的节点调用，用于向集群中的所有其他节点拉票
 func (rf *Raft) StartElection() {
+
+    /// 准备选举请求并为自己投票
 	request := rf.genRequestVoteRequest()
 	DPrintf("{Node %v} starts election with RequestVoteRequest %v", rf.me, request)
-	// use Closure
 	grantedVotes := 1
 	rf.votedFor = rf.me
 	rf.persist()
+
+    /// 遍历除自身外所有节点，为每个节点开一个协程并行发送 RequestVote RPC
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
 		go func(peer int) {
 			response := new(RequestVoteResponse)
+            // 执行实际的 RPC 调用。这是一个同步阻塞调用，会等待直到收到响应、超时或出现网络错误。
 			if rf.sendRequestVote(peer, request, response) {
 				rf.mu.Lock()
 				defer rf.mu.Unlock()
-				DPrintf("{Node %v} receives RequestVoteResponse %v from {Node %v} after sending RequestVoteRequest %v in term %v", rf.me, response, peer, request, rf.currentTerm)
+				DPrintf("{Node %v} receives RequestVoteResponse %v from {Node %v} after sending RequestVoteRequest %v in term %v", 
+                            rf.me, response, peer, request, rf.currentTerm)
+                // 检查当前节点是否仍为 Candidate 状态，并且 term 与发送请求时相同
+                // 因为在等待投票结果的过程中，节点可能会收到其他节点的心跳或投票请求，导致节点任期和状态发生变化
 				if rf.currentTerm == request.Term && rf.state == StateCandidate {
-					if response.VoteGranted {
+					if response.VoteGranted {                   // 处理同意投票
 						grantedVotes += 1
 						if grantedVotes > len(rf.peers)/2 {
 							DPrintf("{Node %v} receives majority votes in term %v", rf.me, rf.currentTerm)
 							rf.ChangeState(StateLeader)
 							rf.BroadcastHeartbeat(true)
 						}
-					} else if response.Term > rf.currentTerm {
-						DPrintf("{Node %v} finds a new leader {Node %v} with term %v and steps down in term %v", rf.me, peer, response.Term, rf.currentTerm)
+					} else if response.Term > rf.currentTerm {  // 处理拒绝投票（发现更高任期）
+						DPrintf("{Node %v} finds a new leader {Node %v} with term %v and steps down in term %v",
+                                    rf.me, peer, response.Term, rf.currentTerm)
 						rf.ChangeState(StateFollower)
 						rf.currentTerm, rf.votedFor = response.Term, -1
 						rf.persist()
@@ -350,24 +376,29 @@ func (rf *Raft) BroadcastHeartbeat(isHeartBeat bool) {
 			continue
 		}
 		if isHeartBeat {
-			// need sending at once to maintain leadership
+			// 需要立即发送以保持领导地位
 			go rf.replicateOneRound(peer)
 		} else {
-			// just signal replicator goroutine to send entries in batch
+			// 只是向信号复制器协程发出信号，以便批量发送条目
 			rf.replicatorCond[peer].Signal()
 		}
 	}
 }
 
+// Leader 节点向特定 Follower 执行单轮日志复制
+//
+// 根据 Follower 的日志落后情况，智能地选择是发送普通的日志追加请求（AppendEntries）还是发送快照（InstallSnapshot）
 func (rf *Raft) replicateOneRound(peer int) {
+    // 状态检查
 	rf.mu.RLock()
 	if rf.state != StateLeader {
 		rf.mu.RUnlock()
 		return
 	}
 	prevLogIndex := rf.nextIndex[peer] - 1
+    // rf.getFirstLog().Index 是 Leader 日志中最早的一条日志的索引。如果 Leader 已经制作了快照，这个值会大于 1
 	if prevLogIndex < rf.getFirstLog().Index {
-		// only snapshot can catch up
+		// 分支 1: 需要发送快照
 		request := rf.genInstallSnapshotRequest()
 		rf.mu.RUnlock()
 		response := new(InstallSnapshotResponse)
@@ -377,7 +408,7 @@ func (rf *Raft) replicateOneRound(peer int) {
 			rf.mu.Unlock()
 		}
 	} else {
-		// just entries can catch up
+		// 分支 2: 可以发送日志条目
 		request := rf.genAppendEntriesRequest(prevLogIndex)
 		rf.mu.RUnlock()
 		response := new(AppendEntriesResponse)
@@ -389,6 +420,7 @@ func (rf *Raft) replicateOneRound(peer int) {
 	}
 }
 
+// 生成一个 RequestVote RPC 的请求参数
 func (rf *Raft) genRequestVoteRequest() *RequestVoteRequest {
 	lastLog := rf.getLastLog()
 	return &RequestVoteRequest{
@@ -399,6 +431,7 @@ func (rf *Raft) genRequestVoteRequest() *RequestVoteRequest {
 	}
 }
 
+// 领导者生成一个 AppendEntries RPC 的请求参数，需要复制的为prevLogIndex之后的日志条目
 func (rf *Raft) genAppendEntriesRequest(prevLogIndex int) *AppendEntriesRequest {
 	firstIndex := rf.getFirstLog().Index
 	entries := make([]Entry, len(rf.logs[prevLogIndex+1-firstIndex:]))
@@ -413,18 +446,22 @@ func (rf *Raft) genAppendEntriesRequest(prevLogIndex int) *AppendEntriesRequest 
 	}
 }
 
+// Leader 节点处理来自 Follower 的 AppendEntries RPC 响应的核心方法
+// 
+// 根据响应的成功与否来更新 Follower 的复制状态，并可能推进提交索引或处理任期过期问题
 func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequest, response *AppendEntriesResponse) {
 	if rf.state == StateLeader && rf.currentTerm == request.Term {
-		if response.Success {
+		if response.Success {   // 响应成功，表示日志条目已成功复制
+            // 更新 matchIndex 为最后一条被复制的日志的索引（请求中前一条日志索引+本次发送的日志条目数）
 			rf.matchIndex[peer] = request.PrevLogIndex + len(request.Entries)
 			rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 			rf.advanceCommitIndexForLeader()
 		} else {
-			if response.Term > rf.currentTerm {
+			if response.Term > rf.currentTerm {     // 失败原因一：发现更高任期
 				rf.ChangeState(StateFollower)
 				rf.currentTerm, rf.votedFor = response.Term, -1
 				rf.persist()
-			} else if response.Term == rf.currentTerm {
+			} else if response.Term == rf.currentTerm { // 失败原因二：日志不一致
 				rf.nextIndex[peer] = response.ConflictIndex
 				if response.ConflictTerm != -1 {
 					firstIndex := rf.getFirstLog().Index
@@ -438,7 +475,10 @@ func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequ
 			}
 		}
 	}
-	DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} after handling AppendEntriesResponse %v for AppendEntriesRequest %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), response, request)
+	DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v}"+ 
+            "after handling AppendEntriesResponse %v for AppendEntriesRequest %v",
+            rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied,
+            rf.getFirstLog(), rf.getLastLog(), response, request)
 }
 
 func (rf *Raft) genInstallSnapshotRequest() *InstallSnapshotRequest {
@@ -452,6 +492,7 @@ func (rf *Raft) genInstallSnapshotRequest() *InstallSnapshotRequest {
 	}
 }
 
+// leader处理安装快照RPC响应
 func (rf *Raft) handleInstallSnapshotResponse(peer int, request *InstallSnapshotRequest, response *InstallSnapshotResponse) {
 	if rf.state == StateLeader && rf.currentTerm == request.Term {
 		if response.Term > rf.currentTerm {
@@ -462,7 +503,10 @@ func (rf *Raft) handleInstallSnapshotResponse(peer int, request *InstallSnapshot
 			rf.matchIndex[peer], rf.nextIndex[peer] = request.LastIncludedIndex, request.LastIncludedIndex+1
 		}
 	}
-	DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v} after handling InstallSnapshotResponse %v for InstallSnapshotRequest %v", rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied, rf.getFirstLog(), rf.getLastLog(), response, request)
+	DPrintf("{Node %v}'s state is {state %v,term %v,commitIndex %v,lastApplied %v,firstLog %v,lastLog %v}"+
+            "after handling InstallSnapshotResponse %v for InstallSnapshotRequest %v",
+            rf.me, rf.state, rf.currentTerm, rf.commitIndex, rf.lastApplied,
+            rf.getFirstLog(), rf.getLastLog(), response, request)
 }
 
 func (rf *Raft) ChangeState(state NodeState) {
@@ -486,7 +530,7 @@ func (rf *Raft) ChangeState(state NodeState) {
 	}
 }
 
-// used to compute and advance commitIndex by matchIndex[]
+// 检查所有Follower的matchIndex，若某个日志索引已被大多数节点复制，则提交该索引及之前的所有日志
 func (rf *Raft) advanceCommitIndexForLeader() {
 	n := len(rf.matchIndex)
 	srt := make([]int, n)
@@ -496,25 +540,30 @@ func (rf *Raft) advanceCommitIndexForLeader() {
 	if newCommitIndex > rf.commitIndex {
 		// only advance commitIndex for current term's log
 		if rf.matchLog(rf.currentTerm, newCommitIndex) {
-			DPrintf("{Node %d} advance commitIndex from %d to %d with matchIndex %v in term %d", rf.me, rf.commitIndex, newCommitIndex, rf.matchIndex, rf.currentTerm)
+			DPrintf("{Node %d} advance commitIndex from %d to %d with matchIndex %v in term %d",
+                        rf.me, rf.commitIndex, newCommitIndex, rf.matchIndex, rf.currentTerm)
 			rf.commitIndex = newCommitIndex
 			rf.applyCond.Signal()
 		} else {
-			DPrintf("{Node %d} can not advance commitIndex from %d because the term of newCommitIndex %d is not equal to currentTerm %d", rf.me, rf.commitIndex, newCommitIndex, rf.currentTerm)
+			DPrintf("{Node %d} can not advance commitIndex from %d because the term of newCommitIndex %d"+
+                    "is not equal to currentTerm %d", rf.me, rf.commitIndex, newCommitIndex, rf.currentTerm)
 		}
 	}
 }
 
-// used to advance commitIndex by leaderCommit
+// 更新 Follower 节点的提交索引
 func (rf *Raft) advanceCommitIndexForFollower(leaderCommit int) {
+    // Follower 只能提交那些它本地已经存在的日志条目
 	newCommitIndex := Min(leaderCommit, rf.getLastLog().Index)
 	if newCommitIndex > rf.commitIndex {
-		DPrintf("{Node %d} advance commitIndex from %d to %d with leaderCommit %d in term %d", rf.me, rf.commitIndex, newCommitIndex, leaderCommit, rf.currentTerm)
+		DPrintf("{Node %d} advance commitIndex from %d to %d with leaderCommit %d in term %d",
+                rf.me, rf.commitIndex, newCommitIndex, leaderCommit, rf.currentTerm)
 		rf.commitIndex = newCommitIndex
-		rf.applyCond.Signal()
+		rf.applyCond.Signal()   // 通过条件变量来唤醒 applier 协程
 	}
 }
 
+// 获取日志中的最后一个条目
 func (rf *Raft) getLastLog() Entry {
 	return rf.logs[len(rf.logs)-1]
 }
@@ -523,13 +572,13 @@ func (rf *Raft) getFirstLog() Entry {
 	return rf.logs[0]
 }
 
-// used by RequestVote Handler to judge which log is newer
+// 投票者用于判断候选人日志是否更新，这两个条件都是确保请求节点的日志更长更新
 func (rf *Raft) isLogUpToDate(term, index int) bool {
 	lastLog := rf.getLastLog()
 	return term > lastLog.Term || (term == lastLog.Term && index >= lastLog.Index)
 }
 
-// used by AppendEntries Handler to judge whether log is matched
+// 跟随者判断日志是否匹配
 func (rf *Raft) matchLog(term, index int) bool {
 	return index <= rf.getLastLog().Index && rf.logs[index-rf.getFirstLog().Index].Term == term
 }
@@ -544,7 +593,10 @@ func (rf *Raft) appendNewEntry(command interface{}) Entry {
 	return newLog
 }
 
-// used by replicator goroutine to judge whether a peer needs replicating
+// 被 replicator 协程调用，判断是否需要复制日志
+//
+// 1. 节点必须是 Leader 状态
+// 2. 跟随者节点的 matchIndex 必须小于领导者日志的最后一个索引
 func (rf *Raft) needReplicating(peer int) bool {
 	rf.mu.RLock()
 	defer rf.mu.RUnlock()
@@ -558,23 +610,12 @@ func (rf *Raft) HasLogInCurrentTerm() bool {
 	return rf.getLastLog().Term == rf.currentTerm
 }
 
-//
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-//
+// Raft 模块对上层服务的主要接口，允许服务请求（如键值存储）向 Raft 集群提交命令
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+    // 确保只有领导者才能接受客户端请求
 	if rf.state != StateLeader {
 		return -1, -1, false
 	}
@@ -607,11 +648,12 @@ func (rf *Raft) Me() int {
 	return rf.me
 }
 
-// The ticker go routine starts a new election if this peer hasn't received
-// heartbeats recently.
+// 状态转移协程（超时触发）
+// 负责处理选举超时（跟随者和候选者）和心跳超时（领导者）
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		select {
+        // Case 1: 选举超时触发 -> 状态转移、任期递增、发起选举、重置计时
 		case <-rf.electionTimer.C:
 			rf.mu.Lock()
 			rf.ChangeState(StateCandidate)
@@ -619,6 +661,7 @@ func (rf *Raft) ticker() {
 			rf.StartElection()
 			rf.electionTimer.Reset(RandomizedElectionTimeout())
 			rf.mu.Unlock()
+        // Case 2: 心跳超时触发 -> 状态检查、广播心跳、重置计时
 		case <-rf.heartbeatTimer.C:
 			rf.mu.Lock()
 			if rf.state == StateLeader {
@@ -630,18 +673,24 @@ func (rf *Raft) ticker() {
 	}
 }
 
-// a dedicated applier goroutine to guarantee that each log will be push into applyCh exactly once, ensuring that service's applying entries and raft's committing entries can be parallel
+// 安全地将已提交（committed）的日志条目应用到上层状态机
+// 独立的 goroutine 确保每个日志条目都恰好通过 applyCh 发送给上层服务一次，且与Raft模块内部提交新日志并行执行
 func (rf *Raft) applier() {
-	for rf.killed() == false {
+	for !rf.killed() {
 		rf.mu.Lock()
-		// if there is no need to apply entries, just release CPU and wait other goroutine's signal if they commit new entries
 		for rf.lastApplied >= rf.commitIndex {
+            // 没有新的已提交日志需要应用，释放锁，阻塞等待applyCond信号唤醒
+            // 避免忙等待，协程让出CPU而不是不断循环检查；其他协程commitIndex增加时可立即唤醒本applier协程
 			rf.applyCond.Wait()
 		}
+
+        // 准备好要应用的日志条目
 		firstIndex, commitIndex, lastApplied := rf.getFirstLog().Index, rf.commitIndex, rf.lastApplied
 		entries := make([]Entry, commitIndex-lastApplied)
 		copy(entries, rf.logs[lastApplied+1-firstIndex:commitIndex+1-firstIndex])
 		rf.mu.Unlock()
+
+        // 应用日志到上层状态机
 		for _, entry := range entries {
 			rf.applyCh <- ApplyMsg{
 				CommandValid: true,
@@ -650,42 +699,49 @@ func (rf *Raft) applier() {
 				CommandIndex: entry.Index,
 			}
 		}
+
+        // 更新已应用的索引 lastApplied
 		rf.mu.Lock()
-		DPrintf("{Node %v} applies entries %v-%v in term %v", rf.me, rf.lastApplied, commitIndex, rf.currentTerm)
-		// use commitIndex rather than rf.commitIndex because rf.commitIndex may change during the Unlock() and Lock()
-		// use Max(rf.lastApplied, commitIndex) rather than commitIndex directly to avoid concurrently InstallSnapshot rpc causing lastApplied to rollback
-		rf.lastApplied = Max(rf.lastApplied, commitIndex)
+		DPrintf("{Node %v} applies entries %v-%v in term %v",
+                    rf.me, rf.lastApplied, commitIndex, rf.currentTerm)
+		// rf.commitIndex 可能已经更改，因此使用 commitIndex
+        // 处理快照时lastApplied可能回滚，直接赋值commitIndex会覆盖，使用Max确保递增的同时不会覆盖正确的回滚操作
+        rf.lastApplied = Max(rf.lastApplied, commitIndex)
 		rf.mu.Unlock()
 	}
 }
 
+// 为每个 Follower 节点专门创建一个独立的日志复制协程
+//
+// 替代简单的周期心跳：Leader 只有一个定时器，每隔一段时间就向所有 Follower 发送一次心跳或日志。
+// 这种方式的问题是：
+// 1.延迟高：即使有新日志产生，也要等到下一个心跳周期才能发送。
+// 2.不均衡：有些 Follower 可能落后很多，需要更频繁的更新，而有些则是最新的，不需要发送数据。
+// replicator 模式的优势：
+// 即时性：当 Leader 有新的日志产生时，立即调用 rf.replicatorCond[peer].Signal() 来唤醒正在休眠的特定 replicator 协程。
+// 这使得日志可以几乎立即被发送给 Follower，而不是等待下一个心跳周期，大大降低了复制延迟。
+// 专用性：每个 Follower 都有自己的复制协程。这意味着为一个缓慢的 Follower 进行重试或追赶不会影响到向其他 Follower 的复制。
+// 效率：使用条件变量 Wait() 而不是简单的睡眠循环，在无事可做时协程会彻底阻塞，不消耗 CPU 资源。
 func (rf *Raft) replicator(peer int) {
 	rf.replicatorCond[peer].L.Lock()
 	defer rf.replicatorCond[peer].L.Unlock()
-	for rf.killed() == false {
-		// if there is no need to replicate entries for this peer, just release CPU and wait other goroutine's signal if service adds new Command
-		// if this peer needs replicating entries, this goroutine will call replicateOneRound(peer) multiple times until this peer catches up, and then wait
+	for !rf.killed() {
+        // 在不需要工作时释放 CPU，等待信号
+		// 一旦需要工作，它会持续调用 replicateOneRound(peer) 直到该 peer 追上最新日志
 		for !rf.needReplicating(peer) {
 			rf.replicatorCond[peer].Wait()
 		}
-		// maybe a pipeline mechanism is better to trade-off the memory usage and catch up time
 		rf.replicateOneRound(peer)
 	}
 }
 
-//
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
-//
+// 创建一个 Raft 服务器，该函数必须快速返回，长时间运行的工作应启动goroutine
+// 所有 Raft 服务器的端口都在 peers[] 中，这台服务器的端口是 peers[me]
+// persister: 用于持久化状态的对象
+// applyCh: 用于发送 ApplyMsg 消息的通道
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+
 	rf := &Raft{
 		peers:          peers,
 		persister:      persister,
@@ -702,21 +758,24 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		heartbeatTimer: time.NewTimer(StableHeartbeatTimeout()),
 		electionTimer:  time.NewTimer(RandomizedElectionTimeout()),
 	}
-	// initialize from state persisted before a crash
+
+    // 从持久化状态中恢复
 	rf.readPersist(persister.ReadRaftState())
 	rf.applyCond = sync.NewCond(&rf.mu)
 	lastLog := rf.getLastLog()
 	for i := 0; i < len(peers); i++ {
+        // 初始化复制索引
 		rf.matchIndex[i], rf.nextIndex[i] = 0, lastLog.Index+1
+        // 为其他节点启动复制协程
 		if i != rf.me {
 			rf.replicatorCond[i] = sync.NewCond(&sync.Mutex{})
-			// start replicator goroutine to replicate entries in batch
+			// 为每个其他节点启动一个独立的日志复制协程
 			go rf.replicator(i)
 		}
 	}
-	// start ticker goroutine to start elections
+	// 开启状态转移协程
 	go rf.ticker()
-	// start applier goroutine to push committed logs into applyCh exactly once
+	// 开启应用日志到状态机的协程
 	go rf.applier()
 
 	return rf
