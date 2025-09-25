@@ -4,6 +4,7 @@ import (
 	"fmt"
 )
 
+// MapPhase/ReducePhase/CompletePhase
 type SchedulePhase uint8
 
 const (
@@ -24,6 +25,7 @@ func (phase SchedulePhase) String() string {
 	panic(fmt.Sprintf("unexpected SchedulePhase %d", phase))
 }
 
+// MapJob/ReduceJob/WaitJob/CompleteJob
 type JobType uint8
 
 const (
@@ -47,6 +49,7 @@ func (job JobType) String() string {
 	panic(fmt.Sprintf("unexpected jobType %d", job))
 }
 
+// Idle/Working/Finished
 type TaskStatus uint8
 
 const (
@@ -56,9 +59,11 @@ const (
 )
 
 func generateMapResultFileName(mapNumber, reduceNumber int) string {
+	// return fmt.Sprintf("MapRes/mr-%d-%d", mapNumber, reduceNumber)
 	return fmt.Sprintf("mr-%d-%d", mapNumber, reduceNumber)
 }
 
 func generateReduceResultFileName(reduceNumber int) string {
+	// return fmt.Sprintf("ReduceRes/mr-out-%d", reduceNumber)
 	return fmt.Sprintf("mr-out-%d", reduceNumber)
 }

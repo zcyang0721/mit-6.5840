@@ -54,6 +54,7 @@ func Worker(mapF func(string, string) []KeyValue,
 	}
 }
 
+// 执行Map任务，将输入文件转换为中间键值对
 func doMapTask(mapF func(string, string) []KeyValue, response *HeartbeatResponse) {
 	fileName := response.FilePath
 	file, err := os.Open(fileName)
@@ -66,17 +67,23 @@ func doMapTask(mapF func(string, string) []KeyValue, response *HeartbeatResponse
 	}
 	file.Close()
 	kva := mapF(fileName, string(content))
+
+	// 分区，作用类似于顺序结构的排序
 	intermediates := make([][]KeyValue, response.NReduce)
 	for _, kv := range kva {
 		index := iHash(kv.Key) % response.NReduce
 		intermediates[index] = append(intermediates[index], kv)
 	}
+
+	// 并发写入中间文件
 	var wg sync.WaitGroup
 	for index, intermediate := range intermediates {
+		// 不同index代表不同分区，intermediate代表分区内的所有键值对
 		wg.Add(1)
 		go func(index int, intermediate []KeyValue) {
 			defer wg.Done()
-			intermediateFilePath := generateMapResultFileName(response.Id, index)
+			intermediateFilePath := generateMapResultFileName(response.Id, index)	// mr-mapId-reduceId
+			// 将键值对编码为JSON格式，每行一个记录
 			var buf bytes.Buffer
 			enc := json.NewEncoder(&buf)
 			for _, kv := range intermediate {
@@ -92,10 +99,13 @@ func doMapTask(mapF func(string, string) []KeyValue, response *HeartbeatResponse
 	doReport(response.Id, MapPhase)
 }
 
+// 执行Reduce任务，处理Map阶段生成的中间文件，产生最终输出
 func doReduceTask(reduceF func(string, []string) string, response *HeartbeatResponse) {
+
+	// 遍历当前Reduce任务分区的中间文件，将键值对解码到kva数组
 	var kva []KeyValue
 	for i := 0; i < response.NMap; i++ {
-		filePath := generateMapResultFileName(i, response.Id)
+		filePath := generateMapResultFileName(i, response.Id)	// mr-mapId-reduceId
 		file, err := os.Open(filePath)
 		if err != nil {
 			log.Fatalf("cannot open %v", filePath)
@@ -110,16 +120,22 @@ func doReduceTask(reduceF func(string, []string) string, response *HeartbeatResp
 		}
 		file.Close()
 	}
+
+	// 按key分组到result中
 	results := make(map[string][]string)
 	// Maybe we need merge sort for larger data
 	for _, kv := range kva {
 		results[kv.Key] = append(results[kv.Key], kv.Value)
 	}
+
+	// 执行Reduce函数，将结果写入缓冲区
 	var buf bytes.Buffer
 	for key, values := range results {
 		output := reduceF(key, values)
 		fmt.Fprintf(&buf, "%v %v\n", key, output)
 	}
+
+	// 写入最终结果文件
 	atomicWriteFile(generateReduceResultFileName(response.Id), &buf)
 	doReport(response.Id, ReducePhase)
 }
@@ -135,6 +151,7 @@ func doReport(id int, phase SchedulePhase) {
 }
 
 func call(rpcName string, args interface{}, reply interface{}) bool {
+	// 建立RPC客户端连接
 	sockName := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockName)
 	if err != nil {
@@ -142,6 +159,7 @@ func call(rpcName string, args interface{}, reply interface{}) bool {
 	}
 	defer c.Close()
 
+	// 发起 RPC 调用
 	err = c.Call(rpcName, args, reply)
 	if err == nil {
 		return true

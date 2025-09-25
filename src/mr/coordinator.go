@@ -1,7 +1,6 @@
 package mr
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -14,6 +13,7 @@ const (
 	MaxTaskRunInterval = time.Second * 10
 )
 
+// 任务描述
 type Task struct {
 	fileName  string
 	id        int
@@ -23,15 +23,15 @@ type Task struct {
 
 // A laziest, worker-stateless, channel-based implementation of Coordinator
 type Coordinator struct {
-	files   []string
+	files   []string		// 待处理的输入文件列表
 	nReduce int
 	nMap    int
-	phase   SchedulePhase
-	tasks   []Task
-
-	heartbeatCh chan heartbeatMsg
-	reportCh    chan reportMsg
-	doneCh      chan struct{}
+	phase   SchedulePhase	// 当前任务调度的阶段
+	tasks   []Task			// 当前阶段的所有任务列表
+	
+	heartbeatCh chan heartbeatMsg	// 接收来自 worker 的心跳消息
+	reportCh    chan reportMsg		// 接收 worker 的任务完成报告
+	doneCh      chan struct{}		// 通知 Coordinator 结束整个调度过程
 }
 
 type heartbeatMsg struct {
@@ -48,8 +48,8 @@ type reportMsg struct {
 //
 func (c *Coordinator) Heartbeat(request *HeartbeatRequest, response *HeartbeatResponse) error {
 	msg := heartbeatMsg{response, make(chan struct{})}
-	c.heartbeatCh <- msg
-	<-msg.ok
+	c.heartbeatCh <- msg	// 将消息发送到心跳通道heartbeatCh
+	<-msg.ok				// 阻塞等待处理完成的信号
 	return nil
 }
 
@@ -78,12 +78,13 @@ func (c *Coordinator) schedule() {
 					c.initCompletePhase()
 					msg.response.JobType = CompleteJob
 				case CompletePhase:
-					panic(fmt.Sprintf("Coordinator: enter unexpected branch"))
+					panic("Coordinator: enter unexpected branch")
 				}
 			}
 			log.Printf("Coordinator: assigned a task %v to worker \n", msg.response)
 			msg.ok <- struct{}{}
 		case msg := <-c.reportCh:
+			// 确保报告的任务阶段与Coordinator当前阶段一致
 			if msg.request.Phase == c.phase {
 				log.Printf("Coordinator: Worker has executed task %v \n", msg.request)
 				c.tasks[msg.request.Id].status = Finished
@@ -93,11 +94,12 @@ func (c *Coordinator) schedule() {
 	}
 }
 
+// 从任务池中选择一个合适的任务分配给工作节点，所有任务已完成返回true
 func (c *Coordinator) selectTask(response *HeartbeatResponse) bool {
 	allFinished, hasNewJob := true, false
 	for id, task := range c.tasks {
 		switch task.status {
-		case Idle:
+		case Idle:	// 空闲任务：分配为working，填充响应，停止遍历（hasNewJob）
 			allFinished, hasNewJob = false, true
 			c.tasks[id].status, c.tasks[id].startTime = Working, time.Now()
 			response.NReduce, response.Id = c.nReduce, id
@@ -106,9 +108,9 @@ func (c *Coordinator) selectTask(response *HeartbeatResponse) bool {
 			} else {
 				response.JobType, response.NMap = ReduceJob, c.nMap
 			}
-		case Working:
+		case Working:	// 运行中任务：检测超时，超时重新分配任务退出遍历
 			allFinished = false
-			if time.Now().Sub(task.startTime) > MaxTaskRunInterval {
+			if time.Since(task.startTime) > MaxTaskRunInterval {
 				hasNewJob = true
 				c.tasks[id].startTime = time.Now()
 				response.NReduce, response.Id = c.nReduce, id
@@ -118,19 +120,21 @@ func (c *Coordinator) selectTask(response *HeartbeatResponse) bool {
 					response.JobType, response.NMap = ReduceJob, c.nMap
 				}
 			}
-		case Finished:
+		case Finished:	// 已完成任务：继续遍历检查下一任务
 		}
 		if hasNewJob {
 			break
 		}
 	}
 
+	// 无任务可分配
 	if !hasNewJob {
 		response.JobType = WaitJob
 	}
 	return allFinished
 }
 
+// 初始化 Map 任务阶段，填充任务描述
 func (c *Coordinator) initMapPhase() {
 	c.phase = MapPhase
 	c.tasks = make([]Task, len(c.files))
@@ -143,6 +147,7 @@ func (c *Coordinator) initMapPhase() {
 	}
 }
 
+// 初始化 Reduce 任务阶段，填充任务描述
 func (c *Coordinator) initReducePhase() {
 	c.phase = ReducePhase
 	c.tasks = make([]Task, c.nReduce)
@@ -154,24 +159,26 @@ func (c *Coordinator) initReducePhase() {
 	}
 }
 
+// 初始化 Complete 任务阶段，通知调度任务已完成
 func (c *Coordinator) initCompletePhase() {
 	c.phase = CompletePhase
 	c.doneCh <- struct{}{}
 }
 
-//
 // start a thread that listens for RPCs from worker.go
-//
 func (c *Coordinator) server() {
+	// 注册 Coordinator 的 RPC 方法
 	rpc.Register(c)
 	rpc.HandleHTTP()
 	//l, e := net.Listen("tcp", ":1234")
 	name := coordinatorSock()
 	os.Remove(name)
+	// 用 HTTP 协议监听 Unix socket
 	l, e := net.Listen("unix", name)
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
+	// 启动后台线程，等待 Worker 发起的 RPC 请求
 	go http.Serve(l, nil)
 }
 
