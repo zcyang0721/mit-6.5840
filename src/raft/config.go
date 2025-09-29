@@ -7,6 +7,11 @@ package raft
 // so, while you can modify this code to help you debug, please
 // test with the original before submitting.
 //
+// 管理一组 Raft 节点（rafts 数组）
+// 模拟网络环境（使用 labrpc 包）
+// 跟踪节点状态和日志一致性
+// 提供测试工具（如检查领导者、等待日志提交等）
+// 验证 Raft 协议的关键特性（如领导者选举、日志复制等）
 
 import "6.824/labgob"
 import "6.824/labrpc"
@@ -38,15 +43,15 @@ func makeSeed() int64 {
 
 type config struct {
 	mu        sync.Mutex
-	t         *testing.T
-	net       *labrpc.Network
-	n         int
-	rafts     []*Raft
-	applyErr  []string // from apply channel readers
-	connected []bool   // whether each server is on the net
+	t         *testing.T		// 测试对象，用于报告错误
+	net       *labrpc.Network	// 模拟网络环境
+	n         int			// Raft 节点数量
+	rafts     []*Raft		// Raft 节点实例数组
+	applyErr  []string 		// from apply channel readers
+	connected []bool   		// whether each server is on the net
 	saved     []*Persister
 	endnames  [][]string            // the port file names each sends to
-	logs      []map[int]interface{} // copy of each server's committed entries
+	logs      []map[int]interface{} // 记录每个节点已提交的日志条目
 	start     time.Time             // time at which make_config() was called
 	// begin()/end() statistics
 	t0        time.Time // time at which test_test.go called cfg.begin()
@@ -59,6 +64,7 @@ type config struct {
 
 var ncpu_once sync.Once
 
+// 初始化与创建集群
 func make_config(t *testing.T, n int, unreliable bool, snapshot bool) *config {
 	ncpu_once.Do(func() {
 		if runtime.NumCPU() < 2 {

@@ -27,8 +27,8 @@ func (response RequestVoteResponse) String() string {
 type AppendEntriesRequest struct {
 	Term         int		// leader 任期号
 	LeaderId     int		// leader 节点 ID（用于 Follower 重定向客户端）
-	PrevLogIndex int		// leader 中要复制的新日志条目之前一个条目的索引（用于一致性检查）
-	PrevLogTerm  int		// leader 中要复制的新日志条目之前一个条目的任期（用于一致性检查）
+	PrevLogIndex int		// leader 要发送给该节点的 nextIndex 条目的前置日志索引
+	PrevLogTerm  int		// leader 要发送给该节点的 nextIndex 条目的前置日志任期
 	LeaderCommit int		// leader 已提交的最高的日志条目索引，更新follower的commitIndex
 	Entries      []Entry	// 需要复制的日志条目，心跳时为空
 }

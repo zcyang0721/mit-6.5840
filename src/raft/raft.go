@@ -31,7 +31,7 @@ type Raft struct {
 	mu        sync.RWMutex        // 读写锁，用于保护节点共享状态的并发访问
 	peers     []*labrpc.ClientEnd // 集群中所有节点的 RPC 通信端点列表
 	persister *Persister          // 持久化存储对象，用于保存 Raft 的核心状态和状态机快照
-	me        int                 // 当然节点索引，当前节点 peers[me]
+	me        int                 // 当前节点索引，当前节点 peers[me]
 	dead      int32               // set by Kill()，控制 goroutine 的退出逻辑
 
 	applyCh        chan ApplyMsg  // 用于向状态机传递已提交日志条目的通道
@@ -141,9 +141,8 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 	return true
 }
 
-// 创建快照
-//
-// 上层服务通知 Raft 模块，已经将直到索引 index 的所有状态都保存到快照里了，不再需要维护这些日志条目了，可以安全截断
+// 创建快照（日志压缩）
+// 上层服务通知 Raft 模块，已经将直到索引 index 的所有状态都保存到快照里了，不再需要维护这些日志条目了，可以安全截断；
 // index: 应用程序已经完成处理的最高日志索引
 // snapshot: 应用程序序列化后的状态机数据
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
@@ -271,7 +270,7 @@ func (rf *Raft) AppendEntries(request *AppendEntriesRequest, response *AppendEnt
 	response.Term, response.Success = rf.currentTerm, true
 }
 
-// follower 应用快照
+// follower 应用快照，通过 applyCh 通知状态机应用快照
 func (rf *Raft) InstallSnapshot(request *InstallSnapshotRequest, response *InstallSnapshotResponse) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -312,14 +311,17 @@ func (rf *Raft) InstallSnapshot(request *InstallSnapshotRequest, response *Insta
 // 发送 RPC 到目标服务器的示例代码
 // labrpc 包模拟了一个有损网络，其中服务器可能无法访问，请求和回复可能会丢失。
 
+// RequestVote RPC
 func (rf *Raft) sendRequestVote(server int, request *RequestVoteRequest, response *RequestVoteResponse) bool {
 	return rf.peers[server].Call("Raft.RequestVote", request, response)
 }
 
+// AppendEntries RPC
 func (rf *Raft) sendAppendEntries(server int, request *AppendEntriesRequest, response *AppendEntriesResponse) bool {
 	return rf.peers[server].Call("Raft.AppendEntries", request, response)
 }
 
+// InstallSnapshot RPC
 func (rf *Raft) sendInstallSnapshot(server int, request *InstallSnapshotRequest, response *InstallSnapshotResponse) bool {
 	return rf.peers[server].Call("Raft.InstallSnapshot", request, response)
 }
@@ -385,8 +387,7 @@ func (rf *Raft) BroadcastHeartbeat(isHeartBeat bool) {
 	}
 }
 
-// Leader 节点向特定 Follower 执行单轮日志复制
-//
+// Leader 节点向特定 Follower 执行单轮日志复制。
 // 根据 Follower 的日志落后情况，智能地选择是发送普通的日志追加请求（AppendEntries）还是发送快照（InstallSnapshot）
 func (rf *Raft) replicateOneRound(peer int) {
     // 状态检查
@@ -446,8 +447,7 @@ func (rf *Raft) genAppendEntriesRequest(prevLogIndex int) *AppendEntriesRequest 
 	}
 }
 
-// Leader 节点处理来自 Follower 的 AppendEntries RPC 响应的核心方法
-// 
+// Leader 节点处理来自 Follower 的 AppendEntries RPC 响应的核心方法。
 // 根据响应的成功与否来更新 Follower 的复制状态，并可能推进提交索引或处理任期过期问题
 func (rf *Raft) handleAppendEntriesResponse(peer int, request *AppendEntriesRequest, response *AppendEntriesResponse) {
 	if rf.state == StateLeader && rf.currentTerm == request.Term {
@@ -519,7 +519,7 @@ func (rf *Raft) ChangeState(state NodeState) {
 	case StateFollower:
 		rf.heartbeatTimer.Stop()
 		rf.electionTimer.Reset(RandomizedElectionTimeout())
-	case StateCandidate:
+	case StateCandidate:	// 候选者不在此处处理，而是放在ticker函数中方便查看
 	case StateLeader:
 		lastLog := rf.getLastLog()
 		for i := 0; i < len(rf.peers); i++ {
@@ -575,6 +575,7 @@ func (rf *Raft) getFirstLog() Entry {
 // 投票者用于判断候选人日志是否更新，这两个条件都是确保请求节点的日志更长更新
 func (rf *Raft) isLogUpToDate(term, index int) bool {
 	lastLog := rf.getLastLog()
+	// 要么任期大，任期相同索引要更长，这样确保该候选者日志更新
 	return term > lastLog.Term || (term == lastLog.Term && index >= lastLog.Index)
 }
 
@@ -648,7 +649,7 @@ func (rf *Raft) Me() int {
 	return rf.me
 }
 
-// 状态转移协程（超时触发）
+// 超时处理函数
 // 负责处理选举超时（跟随者和候选者）和心跳超时（领导者）
 func (rf *Raft) ticker() {
 	for !rf.killed() {
@@ -735,10 +736,9 @@ func (rf *Raft) replicator(peer int) {
 	}
 }
 
-// 创建一个 Raft 服务器，该函数必须快速返回，长时间运行的工作应启动goroutine
-// 所有 Raft 服务器的端口都在 peers[] 中，这台服务器的端口是 peers[me]
-// persister: 用于持久化状态的对象
-// applyCh: 用于发送 ApplyMsg 消息的通道
+// 创建一个 Raft 服务器
+// @persister: 用于持久化状态的对象
+// @applyCh: 用于发送 ApplyMsg 消息的通道
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 
@@ -759,21 +759,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		electionTimer:  time.NewTimer(RandomizedElectionTimeout()),
 	}
 
-    // 从持久化状态中恢复
-	rf.readPersist(persister.ReadRaftState())
+	rf.readPersist(persister.ReadRaftState())	// 从持久化状态中恢复
 	rf.applyCond = sync.NewCond(&rf.mu)
 	lastLog := rf.getLastLog()
 	for i := 0; i < len(peers); i++ {
-        // 初始化复制索引
+        // 初始化复制索引，实际复制时如果发现日志不匹配，会递减 nextIndex 并重试（Raft 协议的日志回溯机制）
 		rf.matchIndex[i], rf.nextIndex[i] = 0, lastLog.Index+1
         // 为其他节点启动复制协程
 		if i != rf.me {
 			rf.replicatorCond[i] = sync.NewCond(&sync.Mutex{})
-			// 为每个其他节点启动一个独立的日志复制协程
+			// 为每个foller启动一个独立的日志复制协程，避免单协程处理所有复制任务导致的阻塞
 			go rf.replicator(i)
 		}
 	}
-	// 开启状态转移协程
+	// 开启节点状态转移协程
 	go rf.ticker()
 	// 开启应用日志到状态机的协程
 	go rf.applier()
