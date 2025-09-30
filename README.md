@@ -274,6 +274,28 @@ genInstallSnapshotRequest
 
 ​	每台键/值服务器（"kvservers"）都有一个关联的 Raft 节点。Clerks 向其关联的 Raft 领导者发送 `Put()` 、 `Append()` 和 `Get()` RPC 调用。键/值服务器代码将 Put/Append/Get 操作提交给 Raft，以便 Raft 日志中包含一系列 Put/Append/Get 操作。所有键/值服务器按顺序执行 Raft 日志中的操作，并将这些操作应用于它们的键/值数据库；目的是让服务器维护键/值数据库的相同副本。
 
+```shell
+#### 系统架构对应的实际代码调用关系（多集群分片系统的单个集群也是这样的逻辑）
+1. Clerk.Command			#client.go
+# RPC
+1. KVServer.Command			#server.go
+2. Raft.Start				#raft.go
+2. Raft.appendNewEntry		#raft.go
+3. Raft.BroadcastHeartbeat	#raft.go
+# replicatorCond
+3. Raft.replicateOneRound	#raft.go
+# RPC
+3. Raft.AppendEntries		#raft.go
+# applyCond
+4. Raft.applier				#raft.go
+# applyCh
+5(7). KVServer.applier		#server.go
+# notifyChans
+6. KVServer.Command			#server.go
+# RPC
+6. Clerk.Command			#client.go
+```
+
 ### 线性一致性
 
 问题描述：
@@ -289,9 +311,8 @@ genInstallSnapshotRequest
 - 重复的 `Get` 请求直接返回第一次发起请求的结果（代码实现好像是每次去状态机执行读请求）
 
 
-
 ```
-cheney@DESKTOP-U6CB5TV:~/go/src/6.824impl01/src/kvraft$ go test -race
+$ go test -race
 Test: one client (3A) ...
   ... Passed --  15.1  5 14135 1327
 Test: ops complete fast enough (3A) ...
@@ -346,10 +367,6 @@ ok      6.824/kvraft    420.104s
 
 
 
-
-
-
-
 ## 多集群分片键值存储系统
 
 ​	单raft的多节点kv数据库在数据增长到一定程度时，所有数据请求都集中在leader上，增加集群压力，延长请求响应时间。因此本节的内容是将数据以某种方式分片（shard）存储到不同的 `raft` 集群（group）上，保证响应数据引流到对应的集群，降低单一集群压力。
@@ -362,7 +379,7 @@ ok      6.824/kvraft    420.104s
 
 配置更新，分片分配到不同组的变更，处理重新配置达成一致
 
-
+![img](./笔记.assets/1880713-20220325233740850-470808177.png)
 
 ### shardctrler 分片控制器
 
@@ -383,7 +400,7 @@ ok      6.824/kvraft    420.104s
 - 拷贝最后一个配置。
 - 删除 `Groups` 中对应的 gid。
 - 将属于这些 gid 的 shard 标记为需要重新分配。
-- 调用负载均衡算法，把这些 shard 分配给剩余的 group。
+- 调用负载均衡算法（每次分配到拥有分片最少的组），把这些 shard 分配给剩余的 group。
 
 > Move 状态机逻辑：把某个 shard 移动到指定 group
 
@@ -425,8 +442,6 @@ ok      6.824/kvraft    420.104s
 
 完成所有 shard 的迁移后，把 `nextConfig` 提升为 `currentConfig`。
 
-
-
 > 分片清理GC
 
 - 在完成分片迁移后，旧 group 上的数据并不会立即消失。
@@ -441,8 +456,6 @@ ok      6.824/kvraft    420.104s
 2. 新 group 启动 GC 任务，向旧 group 发送 `DeleteShardsData` RPC。
 3. 旧 group 在 Raft 内执行删除操作，清理 shard 数据。
 4. GC 完成后，旧 group 不再保存该 shard，也不会再响应该 shard 的客户端请求。
-
-
 
 > 空日志检测
 
@@ -460,4 +473,5 @@ Raft 协议要求：**Leader 在当前任期内必须提交至少一条日志，
 - 空日志不会修改状态机，但能确保 Leader 至少有一条日志在本任期被大多数节点提交。
 
 一旦空日志提交成功，Leader 就能安全地响应读请求，保证线性一致性。
+
 
