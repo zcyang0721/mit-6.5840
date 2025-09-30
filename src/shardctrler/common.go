@@ -23,7 +23,7 @@ import (
 // You will need to add fields to the RPC argument structs.
 //
 
-// 分区数量，每个key映射到一个分区，如hash(key) % NShards
+// 分片数量，每个key映射到一个分片，如hash(key) % NShards
 const NShards = 10
 
 // 配置项，将分片划分配到指定组

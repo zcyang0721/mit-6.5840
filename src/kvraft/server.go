@@ -178,6 +178,7 @@ func (kv *KVServer) removeOutdatedNotifyChan(index int) {
 	delete(kv.notifyChans, index)
 }
 
+// 将日志中的命令应用到到状态机中
 func (kv *KVServer) applyLogToStateMachine(command Command) *CommandResponse {
 	var value string
 	var err Err

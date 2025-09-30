@@ -39,7 +39,7 @@ func (cf *MemoryConfigStateMachine) Join(groups map[int][]string) Err {
 	s2g := Group2Shards(newConfig)
 
 	// 负载均衡循环：每次把source（拥有最多分片的gid）的第一个shard移给target（拥有最少分片的gid），
-	// 直到任意两个组的shard数差≤1，并且没有分区未分配组。
+	// 直到任意两个组的shard数差≤1，并且没有分片未分配组。
 	for {
 		source, target := GetGIDWithMaximumShards(s2g), GetGIDWithMinimumShards(s2g)
 		if source != 0 && len(s2g[source])-len(s2g[target]) <= 1 {
@@ -155,7 +155,7 @@ func GetGIDWithMinimumShards(s2g map[int][]int) int {
 
 // 返回拥有最多分片的组，优先把未分配组（gid=0）的shard分配出去
 func GetGIDWithMaximumShards(s2g map[int][]int) int {
-	// 如果s2g[0]存在且非空，直接返回0（优先把未分配的分区作为source分配出去）
+	// 如果s2g[0]存在且非空，直接返回0（优先把未分配的分片作为source分配出去）
 	if shards, ok := s2g[0]; ok && len(shards) > 0 {
 		return 0
 	}
